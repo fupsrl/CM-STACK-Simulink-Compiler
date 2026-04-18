@@ -131,7 +131,7 @@ After a successful run `result` contains:
 | Address | `RaspberryHost` value (configurable via `AdvertisedAddress`) |
 | Bind address | `0.0.0.0` (configurable via `XcpBindAddress`) |
 
-The XCP server starts automatically when the executable launches. Import the generated A2L and HEX into your tool and connect.
+The XCP server starts automatically when the executable launches. Import the generated A2L and HEX into your tool and connect [INCA SETUP](https://github.com/fupsrl/CM-STACK-Simulink-Compiler/blob/main/INCASetup.md)
 
 ---
 
