@@ -1,0 +1,246 @@
+// cpp_demo XCPlite/libxcplite C++ example
+
+#include <atomic>   // for std::atomic
+#include <csignal>  // for signal(), SIGINT, SIGTERM
+#include <cstdint>  // for uintxx_t
+#include <iostream> // for std::cout
+#include <thread>   // for std::thread
+
+// Include XCPlite/libxcplite C++ headers
+#include "a2l.hpp"    // for A2l generation application programming interface
+#include "xcplib.hpp" // for application programming interface
+
+#include "lookup.hpp"  // for lookup_table::LookupTableT
+#include "sig_gen.hpp" // for signal_generator::SignalGenerator
+
+// New option in V1.1: Enable variadic all in one macros, see examples below
+#define OPTION_USE_VARIADIC_MACROS
+
+//-----------------------------------------------------------------------------------------------------
+// XCP parameters
+
+constexpr const char *OPTION_PROJECT_NAME = "cpp_demo";
+constexpr const char OPTION_PROJECT_VERSION[] = "V1_" __TIME__;
+constexpr bool OPTION_USE_TCP = false;
+constexpr uint16_t OPTION_SERVER_PORT = 5555;
+constexpr size_t OPTION_QUEUE_SIZE = (1024 * 64);
+constexpr int OPTION_LOG_LEVEL = 3;
+constexpr uint8_t OPTION_SERVER_ADDR[] = {0, 0, 0, 0};
+
+//-----------------------------------------------------------------------------------------------------
+// Demo calibration parameters
+
+struct ParametersT {
+    uint16_t counter_max; // Maximum value for the main loop counter
+    uint32_t delay_us;    // Sleep time in microseconds for the main loop
+};
+
+// Default values
+const ParametersT kParameters = {.counter_max = 1000, .delay_us = 1000};
+
+//-----------------------------------------------------------------------------------------------------
+// Demo global measurement values
+
+uint8_t temperature = 50; // In Celsius
+double speed = 0.0f;      // Speed in km/h
+
+//-----------------------------------------------------------------------------------------------------
+// Demo signal generator default parameters
+
+constexpr double kPi = 3.14159265358979323846;
+constexpr double k2Pi = (kPi * 2);
+
+// Default parameter values for 2 instances
+const signal_generator::SignalParametersT kSignalParameters1 = {
+    .ampl = 12.5,
+    .phase = 0.0,
+    .offset = 0.0,
+    .period = 1.0, // s
+    .lookup =
+        {
+            .values = {0.0f, 0.5f, 1.0f, 0.50f, 0.0f, -0.5f, -1.0f, -0.5f, 0.0f, 0.0f, 0.0f},
+#ifdef CANAPE_24
+            .lookup_axis = {0.0f, 0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f, 1.0f},
+#endif
+        },
+    .delay_us = 1000,                                       // us
+    .signal_type = signal_generator::SignalTypeT::TRIANGLE, // Type of the signal
+};
+const signal_generator::SignalParametersT kSignalParameters2 = {
+    .ampl = 80.0,
+    .phase = kPi / 2,
+    .offset = 0.0,
+    .period = 10.0, // s
+    .lookup =
+        {
+            .values = {0.0f, 0.1f, 0.3f, 0.6f, 0.8f, 1.0f, 0.80f, 0.6f, 0.3f, 0.1f, 0.0f},
+#ifdef CANAPE_24
+            .lookup_axis = {0.0f, 0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f, 1.0f},
+#endif
+        },
+    .delay_us = 1000,                                   // us
+    .signal_type = signal_generator::SignalTypeT::SINE, // Type of the signal
+};
+
+//-----------------------------------------------------------------------------------------------------
+
+// Signal handler for clean shutdown
+static volatile bool running = true;
+static void sig_handler(int sig) { running = false; }
+
+int main() {
+
+    std::cout << "\nXCP on Ethernet cpp_demo C++ demo\n" << std::endl;
+    signal(SIGINT, sig_handler);
+    signal(SIGTERM, sig_handler);
+
+    // Set log level (1-error, 2-warning, 3-info, 4-show XCP commands)
+    XcpSetLogLevel(OPTION_LOG_LEVEL);
+
+    // Initialize the XCP singleton, activate XCP, must be called before starting the server
+    // If XCP is not activated, the server will not start and all XCP instrumentation will be passive with minimal overhead
+    XcpInit(OPTION_PROJECT_NAME, OPTION_PROJECT_VERSION /* EPK version*/, XCP_MODE_LOCAL);
+
+    // Initialize the XCP Server
+    if (!XcpEthServerInit(OPTION_SERVER_ADDR, OPTION_SERVER_PORT, OPTION_USE_TCP, OPTION_QUEUE_SIZE)) {
+        std::cerr << "Failed to initialize XCP server" << std::endl;
+        return 1;
+    }
+
+    // Enable A2L generation
+    // Set mode to write once to create stable A2L files, this also enables calibration segment persistence and freeze support
+    if (!A2lInit(OPTION_SERVER_ADDR, OPTION_SERVER_PORT, OPTION_USE_TCP, A2L_MODE_WRITE_ONCE | A2L_MODE_FINALIZE_ON_CONNECT | A2L_MODE_AUTO_GROUPS)) {
+        std::cerr << "Failed to initialize A2L generator" << std::endl;
+        return 1;
+    }
+
+    // Create a calibration segment wrapper for the struct 'ParametersT' and use its default values in constant 'kParameters'
+    // This calibration segment has a working page (RAM) and a reference page (FLASH), it creates a MEMORY_SEGMENT in the A2L file
+    // It provides safe (thread safe against XCP modifications), lock-free and consistent access to the calibration parameters
+    // It supports XCP/ECU independent page switching, checksum calculation and reinitialization (copy reference page to working page)
+    auto calseg = CalSegCreate(kParameters);
+
+    // Add the calibration segment description as a typedef instance to the A2L file
+    A2lTypedefBegin(ParametersT, &kParameters, "A2L Typedef for ParametersT");
+    A2lTypedefParameterComponent(counter_max, "Maximum counter value", "", 0, 2000);
+    A2lTypedefParameterComponent(delay_us, "Mainloop delay time in us", "us", 0, 999999);
+    A2lTypedefEnd();
+    calseg.CreateA2lTypedefInstance("ParametersT", "Main parameters");
+
+    // Local variables
+    uint16_t counter = 0;
+    double sum = 0, channel1 = 0, channel2 = 0;
+
+    // Local histogram for mainloop cycle time measurement
+    constexpr size_t kHistogramSize = 128; // 128 bins
+    constexpr uint64_t kHistogramBin = 50; // 50 us per bin
+    uint64_t loop_cycletime = 0;
+    uint32_t loop_histogram[kHistogramSize] = {};
+
+    // @@@@ TODO: Add support for C-style arrays to the variadic alternative
+    // See hello_xcp_cpp for example how to use the variadic macros for measurement registration of simple arithmetic type
+
+    // Create conversion rules for physical measurements
+    A2lCreateLinearConversion(temperature, "Temperature in °C from unsigned byte", "°C", 1.0, -50.0);
+    A2lCreateLinearConversion(clock_ticks, "Conversion from clock ticks to milliseconds", "ms", 1.0 / 1000.0, 0.0);
+
+#ifndef OPTION_USE_VARIADIC_MACROS
+    // Create a measurement event 'mainloop'
+    DaqCreateEvent(mainloop);
+
+    // Register the global measurement variables 'temperature' and 'speed'
+    A2lSetAbsoluteAddrMode(mainloop);
+    A2lCreatePhysMeasurement(temperature, "Motor temperature in °C", "conv.temperature", -50.0, 200.0);
+    A2lCreatePhysMeasurement(speed, "Speed in km/h", "km/h", 0, 250.0);
+
+    // Register the local measurement variables 'loop_counter', 'loop_cycletime', 'loop_histogram' and 'sum'
+    A2lSetStackAddrMode(mainloop);
+    A2lCreateMeasurement(counter, "Mainloop loop counter");
+    A2lCreateMeasurement(sum, "Sum of SigGen1 and SigGen2 value");
+    A2lCreatePhysMeasurement(loop_cycletime, "Mainloop cycle time", "conv.clock_ticks", 0.0, 0.05);
+    A2lCreateMeasurementArray(loop_histogram, "Mainloop cycle time histogram");
+#endif
+
+    // Signal generator C++ class demo
+    // See sig_gen.cpp for details how to measure instance members and stack variables in member functions
+    // Create 2 signal generator instances of class SignalGenerator with individual parameters
+    // Note that the signal generator threads register measurements in the A2L file as well
+    // This is not in conflict because the main thread has already registered its measurements above
+    // Otherwise use A2lLock() and A2lUnlock() to avoid race conditions when registering measurements, the A2L generator macros for are not thread safe by itself
+    signal_generator::SignalGenerator signal_generator_1("SigGen1", &kSignalParameters1);
+    signal_generator::SignalGenerator signal_generator_2("SigGen2", &kSignalParameters2);
+
+    sleepUs(100000);
+
+    // Main loop
+    std::cout << "Starting main loop..." << std::endl;
+    uint64_t loop_time = clockGetMonotonicUs();
+    uint64_t last_loop_time = loop_time;
+    while (running) {
+        // Access the calibration parameters 'delay' and 'counter_max' safely
+        // Use RAII guard for automatic lock/unlock the calibration parameter segment 'calseg'
+        {
+            auto parameters = calseg.lock();
+
+            // Increment the local measurement variable 'loop_counter' using the calibration parameter 'counter_max' as a limit
+            counter++;
+            if (counter > parameters->counter_max)
+                counter = 0;
+
+        } // Guard automatically unlocks here
+
+        // Measure and calculate the mainloop cycle time, build histogram
+        last_loop_time = loop_time;
+        loop_time = clockGetMonotonicUs();
+        loop_cycletime = loop_time - last_loop_time;
+        loop_histogram[(loop_cycletime >= (kHistogramBin * (kHistogramSize - 1))) ? (kHistogramSize - 1) : (loop_cycletime / kHistogramBin)]++;
+
+        // Sum the values of signal generator 1+2 into the local variable sum
+        channel1 = signal_generator_1.GetValue();
+        channel2 = signal_generator_2.GetValue();
+        sum = channel1 + channel2;
+
+        // Update some more local and global variables
+        if (counter == 0) {
+            temperature += 1;
+            if (temperature > 150)
+                temperature = 0; // Reset temperature to -50 °C
+        }
+        speed += (250.0f - speed) * 0.0001;
+        if (speed > 245.0f)
+            speed = 0; // Reset speed to 0 km/h
+
+        // Trigger the XCP measurement mainloop for temperature, speed, counter and sum
+#ifndef OPTION_USE_VARIADIC_MACROS
+        DaqTriggerEvent(mainloop);
+#else
+        DaqEventVar(mainloop,                                                                                //
+                    A2L_MEAS_PHYS(temperature, "Motor temperature in °C", "conv.temperature", -50.0, 200.0), //
+                    A2L_MEAS_PHYS(speed, "Speed in km/h", "km/h", 0, 250.0),                                 //
+                    A2L_MEAS(counter, "Mainloop loop counter"),                                              //
+                    A2L_MEAS(sum, "Sum of SigGen1 and SigGen2 value"),                                       //
+                    A2L_MEAS_PHYS(loop_cycletime, "Mainloop cycle time", "conv.clock_ticks", 0.0, 0.05),     //
+                    A2L_MEAS_ARRAY(loop_histogram, "Mainloop cycle time histogram")                          //
+        );
+#endif
+
+        sleepUs(calseg.lock()->delay_us);
+
+    } // while (running)
+
+    XcpDisconnect();        // Force disconnect the XCP client
+    A2lFinalize();          // Finalize A2L generation, if not done yet
+    XcpEthServerShutdown(); // Stop the XCP server
+    return 0;
+}
+
+/*
+
+ // Make kDelayUs a tunable parameter
+        // auto delay_us = CalValCreate(kDelayUs);
+        // if (A2lOnce()) { // Create the parameter description in A2L once
+        //     A2lCreateParameter(kDelayUs, "Loop delay in microseconds", "", 0, 1000000);
+        // }
+        // sleepUs(*delay_us.lock());
+
+*/

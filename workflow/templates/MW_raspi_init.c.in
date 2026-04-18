@@ -1,0 +1,19 @@
+#include <stdio.h>
+
+#include "MW_raspi_init.h"
+
+void mwRaspiInit(void) {
+    printf("**** Starting the native XCPlite-enabled application ****\n");
+    fflush(stdout);
+}
+
+int mwRaspiTerminate(void) {
+    printf("**** Stopping the native XCPlite-enabled application ****\n");
+    fflush(stdout);
+    return 1;
+}
+
+void reportOverrun(int taskId) {
+    fprintf(stderr, "Overrun detected for task %d\n", taskId);
+    fflush(stderr);
+}

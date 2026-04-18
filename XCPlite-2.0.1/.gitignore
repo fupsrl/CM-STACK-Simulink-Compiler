@@ -1,0 +1,33 @@
+
+build
+build-*
+clang_tidy
+
+
+# CANape artefacts
+*.hex 
+*.mf4
+*.cnaxml
+*.tmp
+CANape.aml
+CANapeTmpMea.ini
+RecycleBin.ini
+
+
+# Examples .a2l and .bin files
+/*.a2l
+*.bin
+
+# Temporary files
+test_bintool
+*.bak
+*.log
+*.txt
+
+
+# Other
+.vscode
+.DS_Store
+/ptptool.obs
+/docs/CPP_TYPE_TRAITS_GUIDE.md
+/docs/SUBMODULE_GUIDE.md

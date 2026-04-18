@@ -126,7 +126,7 @@ After a successful run `result` contains:
 
 | Parameter | Default |
 |---|---|
-| Transport | UDP |
+| Transport | TCP |
 | Port | `5555` |
 | Address | `RaspberryHost` value (configurable via `AdvertisedAddress`) |
 | Bind address | `0.0.0.0` (configurable via `XcpBindAddress`) |

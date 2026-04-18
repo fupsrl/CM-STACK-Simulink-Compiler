@@ -1,0 +1,1165 @@
+#include "@MODEL_NAME@.h"
+#include "native_xcp_runtime.h"
+
+#include "MW_custom_RTOS_header.h"
+#include "a2l.h"
+#include "builtin_typeid_types.h"
+#include "cal.h"
+#include "linuxinitialize.h"
+#include "platform.h"
+#include "rtw_capi.h"
+#include "rtw_modelmap.h"
+#include "xcp.h"
+#include "xcplib.h"
+
+#include <math.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define NATIVE_XCP_MODEL_NAME "@MODEL_NAME@"
+#define NATIVE_XCP_MODEL_EPK "@MODEL_EPK@"
+#define NATIVE_XCP_BIND_ADDRESS "@XCP_BIND_ADDRESS@"
+#define NATIVE_XCP_PORT ((uint16_t)@XCP_PORT@)
+#define NATIVE_XCP_QUEUE_BYTES ((uint32_t)@XCP_QUEUE_BYTES@)
+#define NATIVE_XCP_MODEL_CORE_A @MODEL_CORE_A@
+#define NATIVE_XCP_MODEL_CORE_B @MODEL_CORE_B@
+#define NATIVE_XCP_XCP_CORE @XCP_SERVER_CORE@
+#define NATIVE_XCP_ENABLE_CALIBRATION_DEBUG @ENABLE_CALIBRATION_DEBUG@
+#define NATIVE_XCP_DEBUG_PREVIEW_BYTES 16u
+#define NATIVE_XCP_DEBUG_DUMP_LIMIT 64u
+#define NATIVE_XCP_WORKING_PAGE 0u
+#define NATIVE_XCP_REFERENCE_PAGE 1u
+
+#define NATIVE_XCP_SYMBOL_CAPACITY 192u
+#define NATIVE_XCP_COMMENT_CAPACITY 256u
+#define NATIVE_XCP_MAX_EVENTS 64u
+#define NATIVE_XCP_MAX_CALSEGS 256u
+#define NATIVE_XCP_CAL_SEGMENT_LIMIT 65535u
+#define NATIVE_XCP_CAL_GAP_LIMIT 256u
+
+#define NATIVE_XCP_MODEL_MMI (&@MODEL_NAME@_M->DataMapInfo.mmi)
+
+typedef struct {
+    uintptr_t start;
+    uintptr_t end;
+    size_t size;
+    tXcpCalSegIndex handle;
+    tXcpCalSegNumber number;
+    char name[48];
+#if NATIVE_XCP_ENABLE_CALIBRATION_DEBUG
+    uint8_t lastXcpPage;
+    uint8_t lastEcuPage;
+    bool snapshotValid[2];
+    uint8_t *snapshots[2];
+#endif
+} NativeXcpCalSeg;
+
+typedef struct {
+    uintptr_t start;
+    uintptr_t end;
+} NativeXcpRange;
+
+typedef struct {
+    bool initialized;
+    bool a2lFinalized;
+    size_t eventCount;
+    size_t calSegCount;
+#if NATIVE_XCP_ENABLE_CALIBRATION_DEBUG
+    bool debugSnapshotPending;
+    uint64_t debugLastSnapshotClock;
+#endif
+    tXcpEventId events[NATIVE_XCP_MAX_EVENTS];
+    NativeXcpCalSeg calSegs[NATIVE_XCP_MAX_CALSEGS];
+} NativeXcpContext;
+
+static NativeXcpContext gNativeXcp = {0};
+
+static void nativeXcpBuildSymbol_(char *dst,
+                                  size_t capacity,
+                                  const char *prefix,
+                                  const char *path,
+                                  const char *name,
+                                  uint32_t ordinal);
+static tA2lTypeId nativeXcpGetType_(const rtwCAPI_DataTypeMap *typeMap, uint16_T typeIndex);
+static uint32_t nativeXcpGetDimensions_(const rtwCAPI_DimensionMap *dimMap,
+                                        const uint_T *dimensionArray,
+                                        uint16_T dimIndex,
+                                        uint32_t *xDim,
+                                        uint32_t *yDim,
+                                        uint32_t *numDimsOut);
+
+#if NATIVE_XCP_ENABLE_CALIBRATION_DEBUG
+static const char *nativeXcpPageName_(uint8_t page) {
+    switch (page) {
+      case NATIVE_XCP_WORKING_PAGE:
+        return "working";
+      case NATIVE_XCP_REFERENCE_PAGE:
+        return "reference";
+      default:
+        return "unknown";
+    }
+}
+
+static void nativeXcpFormatHexBytes_(char *dst, size_t capacity, const uint8_t *src, size_t count) {
+    size_t offset = 0u;
+    size_t i;
+
+    if (dst == NULL || capacity == 0u) {
+        return;
+    }
+
+    dst[0] = '\0';
+    if (src == NULL || count == 0u) {
+        return;
+    }
+
+    for (i = 0u; i < count && offset + 3u < capacity; ++i) {
+        const int written = snprintf(dst + offset, capacity - offset, "%s%02X", i == 0u ? "" : " ", src[i]);
+        if (written < 0) {
+            break;
+        }
+        offset += (size_t)written;
+        if (offset >= capacity) {
+            dst[capacity - 1u] = '\0';
+            break;
+        }
+    }
+}
+
+static void nativeXcpInitCalDebug_(NativeXcpCalSeg *seg) {
+    size_t page;
+
+    if (seg == NULL || seg->size == 0u) {
+        return;
+    }
+
+    seg->lastXcpPage = XcpCalSegGetCalPage(seg->number, CAL_PAGE_MODE_XCP);
+    seg->lastEcuPage = XcpCalSegGetCalPage(seg->number, CAL_PAGE_MODE_ECU);
+    for (page = 0u; page < 2u; ++page) {
+        seg->snapshots[page] = (uint8_t *)malloc(seg->size);
+        if (seg->snapshots[page] != NULL) {
+            memcpy(seg->snapshots[page], (const void *)seg->start, seg->size);
+            seg->snapshotValid[page] = true;
+        }
+    }
+
+    fprintf(stdout, "native_xcp: cal debug enabled for %s (segment=%u size=%zu)\n",
+        seg->name, (unsigned)seg->number, seg->size);
+    fflush(stdout);
+}
+
+static void nativeXcpFreeCalDebug_(NativeXcpCalSeg *seg) {
+    size_t page;
+
+    if (seg == NULL) {
+        return;
+    }
+
+    for (page = 0u; page < 2u; ++page) {
+        free(seg->snapshots[page]);
+        seg->snapshots[page] = NULL;
+        seg->snapshotValid[page] = false;
+    }
+}
+
+static bool nativeXcpLogCalPageState_(NativeXcpCalSeg *seg) {
+    const uint8_t xcpPage = XcpCalSegGetCalPage(seg->number, CAL_PAGE_MODE_XCP);
+    const uint8_t ecuPage = XcpCalSegGetCalPage(seg->number, CAL_PAGE_MODE_ECU);
+
+    if (xcpPage == seg->lastXcpPage && ecuPage == seg->lastEcuPage) {
+        return false;
+    }
+
+    fprintf(stdout,
+        "native_xcp: cal page switch %s xcp=%s ecu=%s\n",
+        seg->name,
+        nativeXcpPageName_(xcpPage),
+        nativeXcpPageName_(ecuPage));
+    fflush(stdout);
+    seg->lastXcpPage = xcpPage;
+    seg->lastEcuPage = ecuPage;
+    return true;
+}
+
+static bool nativeXcpLogCalMutation_(NativeXcpCalSeg *seg, const uint8_t *activePage) {
+    uint8_t page;
+    uint8_t *snapshot;
+    size_t diffOffset = 0u;
+    size_t diffCount = 0u;
+    size_t i;
+    char beforeHex[NATIVE_XCP_DEBUG_PREVIEW_BYTES * 3u + 1u];
+    char afterHex[NATIVE_XCP_DEBUG_PREVIEW_BYTES * 3u + 1u];
+
+    if (seg == NULL || activePage == NULL) {
+        return false;
+    }
+
+    page = XcpCalSegGetCalPage(seg->number, CAL_PAGE_MODE_XCP);
+    if (page > NATIVE_XCP_REFERENCE_PAGE || seg->snapshots[page] == NULL) {
+        return false;
+    }
+
+    snapshot = seg->snapshots[page];
+    if (!seg->snapshotValid[page]) {
+        memcpy(snapshot, activePage, seg->size);
+        seg->snapshotValid[page] = true;
+        return false;
+    }
+
+    for (i = 0u; i < seg->size; ++i) {
+        if (snapshot[i] != activePage[i]) {
+            diffOffset = i;
+            break;
+        }
+    }
+    if (i == seg->size) {
+        return false;
+    }
+
+    diffCount = 1u;
+    for (i = diffOffset + 1u; i < seg->size && diffCount < NATIVE_XCP_DEBUG_PREVIEW_BYTES; ++i) {
+        if (snapshot[i] == activePage[i] && diffCount >= 4u) {
+            break;
+        }
+        diffCount++;
+    }
+
+    nativeXcpFormatHexBytes_(beforeHex, sizeof(beforeHex), snapshot + diffOffset, diffCount);
+    nativeXcpFormatHexBytes_(afterHex, sizeof(afterHex), activePage + diffOffset, diffCount);
+    fprintf(stdout,
+        "native_xcp: cal write %s page=%s offset=0x%zX bytes=%zu before=[%s] after=[%s]\n",
+        seg->name,
+        nativeXcpPageName_(page),
+        diffOffset,
+        diffCount,
+        beforeHex,
+        afterHex);
+    fflush(stdout);
+
+    memcpy(snapshot, activePage, seg->size);
+    return true;
+}
+
+static const char *nativeXcpTypeName_(tA2lTypeId typeId) {
+    switch (typeId) {
+      case A2L_TYPE_DOUBLE:
+        return "F64";
+      case A2L_TYPE_FLOAT:
+        return "F32";
+      case A2L_TYPE_INT8:
+        return "I8";
+      case A2L_TYPE_UINT8:
+        return "U8";
+      case A2L_TYPE_INT16:
+        return "I16";
+      case A2L_TYPE_UINT16:
+        return "U16";
+      case A2L_TYPE_INT32:
+        return "I32";
+      case A2L_TYPE_UINT32:
+        return "U32";
+      default:
+        return "UNKNOWN";
+    }
+}
+
+static bool nativeXcpFormatScalarValue_(char *dst, size_t capacity, const void *ptr, tA2lTypeId typeId) {
+    if (dst == NULL || capacity == 0u || ptr == NULL) {
+        return false;
+    }
+
+    switch (typeId) {
+      case A2L_TYPE_DOUBLE:
+        (void)snprintf(dst, capacity, "%.17g", *(const double *)ptr);
+        return true;
+      case A2L_TYPE_FLOAT:
+        (void)snprintf(dst, capacity, "%.9g", (double)*(const float *)ptr);
+        return true;
+      case A2L_TYPE_INT8:
+        (void)snprintf(dst, capacity, "%d", (int)*(const int8_t *)ptr);
+        return true;
+      case A2L_TYPE_UINT8:
+        (void)snprintf(dst, capacity, "%u", (unsigned int)*(const uint8_t *)ptr);
+        return true;
+      case A2L_TYPE_INT16:
+        (void)snprintf(dst, capacity, "%d", (int)*(const int16_t *)ptr);
+        return true;
+      case A2L_TYPE_UINT16:
+        (void)snprintf(dst, capacity, "%u", (unsigned int)*(const uint16_t *)ptr);
+        return true;
+      case A2L_TYPE_INT32:
+        (void)snprintf(dst, capacity, "%ld", (long)*(const int32_t *)ptr);
+        return true;
+      case A2L_TYPE_UINT32:
+        (void)snprintf(dst, capacity, "%lu", (unsigned long)*(const uint32_t *)ptr);
+        return true;
+      default:
+        break;
+    }
+
+    dst[0] = '\0';
+    return false;
+}
+
+static void nativeXcpDebugPrintRegistration_(const char *kind,
+                                             const char *symbol,
+                                             const void *ptr,
+                                             tA2lTypeId typeId,
+                                             uint32_t totalCount,
+                                             const NativeXcpCalSeg *seg,
+                                             int32_t eventIndex) {
+    char valueText[64];
+
+    if (kind == NULL || symbol == NULL || ptr == NULL) {
+        return;
+    }
+
+    if (totalCount <= 1u && nativeXcpFormatScalarValue_(valueText, sizeof(valueText), ptr, typeId)) {
+        if (seg != NULL) {
+            fprintf(stdout,
+                "native_xcp: map %s %s addr=%p seg=%s offset=0x%zX type=%s value=%s\n",
+                kind,
+                symbol,
+                ptr,
+                seg->name,
+                (size_t)((uintptr_t)ptr - seg->start),
+                nativeXcpTypeName_(typeId),
+                valueText);
+        } else if (eventIndex >= 0) {
+            fprintf(stdout,
+                "native_xcp: map %s %s addr=%p event=%ld type=%s value=%s\n",
+                kind,
+                symbol,
+                ptr,
+                (long)eventIndex,
+                nativeXcpTypeName_(typeId),
+                valueText);
+        } else {
+            fprintf(stdout,
+                "native_xcp: map %s %s addr=%p type=%s value=%s\n",
+                kind,
+                symbol,
+                ptr,
+                nativeXcpTypeName_(typeId),
+                valueText);
+        }
+    } else {
+        if (seg != NULL) {
+            fprintf(stdout,
+                "native_xcp: map %s %s addr=%p seg=%s offset=0x%zX type=%s count=%u\n",
+                kind,
+                symbol,
+                ptr,
+                seg->name,
+                (size_t)((uintptr_t)ptr - seg->start),
+                nativeXcpTypeName_(typeId),
+                (unsigned)totalCount);
+        } else if (eventIndex >= 0) {
+            fprintf(stdout,
+                "native_xcp: map %s %s addr=%p event=%ld type=%s count=%u\n",
+                kind,
+                symbol,
+                ptr,
+                (long)eventIndex,
+                nativeXcpTypeName_(typeId),
+                (unsigned)totalCount);
+        } else {
+            fprintf(stdout,
+                "native_xcp: map %s %s addr=%p type=%s count=%u\n",
+                kind,
+                symbol,
+                ptr,
+                nativeXcpTypeName_(typeId),
+                (unsigned)totalCount);
+        }
+    }
+}
+
+static void nativeXcpDebugDumpScalar_(const char *kind,
+                                      const char *symbol,
+                                      const void *ptr,
+                                      tA2lTypeId typeId,
+                                      uint32_t totalCount) {
+    char valueText[64];
+
+    if (kind == NULL || symbol == NULL || ptr == NULL || totalCount > 1u) {
+        return;
+    }
+    if (!nativeXcpFormatScalarValue_(valueText, sizeof(valueText), ptr, typeId)) {
+        return;
+    }
+
+    fprintf(stdout, "native_xcp: snapshot %s %s addr=%p type=%s value=%s\n",
+        kind, symbol, ptr, nativeXcpTypeName_(typeId), valueText);
+}
+
+static void nativeXcpDebugDumpCalPages_(void) {
+    size_t i;
+
+    for (i = 0u; i < gNativeXcp.calSegCount; ++i) {
+        const NativeXcpCalSeg *seg = &gNativeXcp.calSegs[i];
+        const uint8_t xcpPage = XcpCalSegGetCalPage(seg->number, CAL_PAGE_MODE_XCP);
+        const uint8_t ecuPage = XcpCalSegGetCalPage(seg->number, CAL_PAGE_MODE_ECU);
+
+        fprintf(stdout, "native_xcp: snapshot calseg %s xcp=%s ecu=%s\n",
+            seg->name,
+            nativeXcpPageName_(xcpPage),
+            nativeXcpPageName_(ecuPage));
+    }
+}
+
+static void nativeXcpDebugDumpRuntimeScalars_(const rtwCAPI_ModelMappingInfo *mmi, const char *reason) {
+    const rtwCAPI_Signals *signals = rtwCAPI_GetSignals(mmi);
+    const rtwCAPI_States *states = rtwCAPI_GetStates(mmi);
+    const rtwCAPI_BlockParameters *blockParameters = rtwCAPI_GetBlockParameters(mmi);
+    const rtwCAPI_ModelParameters *modelParameters = rtwCAPI_GetModelParameters(mmi);
+    const rtwCAPI_DataTypeMap *dataTypes = rtwCAPI_GetDataTypeMap(mmi);
+    const rtwCAPI_DimensionMap *dimMap = rtwCAPI_GetDimensionMap(mmi);
+    const uint_T *dimensionArray = rtwCAPI_GetDimensionArray(mmi);
+    void *const *dataAddressMap = (void *const *)rtwCAPI_GetDataAddressMap(mmi);
+    size_t printedParameters = 0u;
+    size_t printedSignals = 0u;
+    size_t printedStates = 0u;
+    size_t ordinal = 0u;
+    size_t i;
+
+    fprintf(stdout, "native_xcp: snapshot reason=%s\n", reason != NULL ? reason : "runtime");
+    nativeXcpDebugDumpCalPages_();
+
+    for (i = 0u; i < (size_t)rtwCAPI_GetNumBlockParameters(mmi) && printedParameters < NATIVE_XCP_DEBUG_DUMP_LIMIT; ++i, ++ordinal) {
+        char symbol[NATIVE_XCP_SYMBOL_CAPACITY];
+        const uint32_t totalCount = nativeXcpGetDimensions_(dimMap, dimensionArray,
+            rtwCAPI_GetBlockParameterDimensionIdx(blockParameters, i), NULL, NULL, NULL);
+        const tA2lTypeId typeId = nativeXcpGetType_(dataTypes, rtwCAPI_GetBlockParameterDataTypeIdx(blockParameters, i));
+        const void *ptr = rtwCAPI_GetDataAddress(dataAddressMap, rtwCAPI_GetBlockParameterAddrIdx(blockParameters, i));
+
+        if (typeId == A2L_TYPE_UNDEFINED || ptr == NULL || totalCount != 1u) {
+            continue;
+        }
+
+        nativeXcpBuildSymbol_(symbol, sizeof(symbol), "PAR", rtwCAPI_GetBlockParameterBlockPath(blockParameters, i),
+            rtwCAPI_GetBlockParameterName(blockParameters, i), (uint32_t)ordinal);
+        nativeXcpDebugDumpScalar_("parameter", symbol, ptr, typeId, totalCount);
+        printedParameters++;
+    }
+
+    for (i = 0u; i < (size_t)rtwCAPI_GetNumModelParameters(mmi) && printedParameters < NATIVE_XCP_DEBUG_DUMP_LIMIT; ++i, ++ordinal) {
+        char symbol[NATIVE_XCP_SYMBOL_CAPACITY];
+        const uint32_t totalCount = nativeXcpGetDimensions_(dimMap, dimensionArray,
+            rtwCAPI_GetModelParameterDimensionIdx(modelParameters, i), NULL, NULL, NULL);
+        const tA2lTypeId typeId = nativeXcpGetType_(dataTypes, rtwCAPI_GetModelParameterDataTypeIdx(modelParameters, i));
+        const void *ptr = rtwCAPI_GetDataAddress(dataAddressMap, rtwCAPI_GetModelParameterAddrIdx(modelParameters, i));
+
+        if (typeId == A2L_TYPE_UNDEFINED || ptr == NULL || totalCount != 1u) {
+            continue;
+        }
+
+        nativeXcpBuildSymbol_(symbol, sizeof(symbol), "MODEL_PAR", NULL,
+            rtwCAPI_GetModelParameterName(modelParameters, i), (uint32_t)ordinal);
+        nativeXcpDebugDumpScalar_("parameter", symbol, ptr, typeId, totalCount);
+        printedParameters++;
+    }
+
+    for (i = 0u; i < (size_t)rtwCAPI_GetNumSignals(mmi) && printedSignals < NATIVE_XCP_DEBUG_DUMP_LIMIT; ++i, ++ordinal) {
+        char symbol[NATIVE_XCP_SYMBOL_CAPACITY];
+        const uint32_t totalCount = nativeXcpGetDimensions_(dimMap, dimensionArray,
+            rtwCAPI_GetSignalDimensionIdx(signals, i), NULL, NULL, NULL);
+        const tA2lTypeId typeId = nativeXcpGetType_(dataTypes, rtwCAPI_GetSignalDataTypeIdx(signals, i));
+        const void *ptr = rtwCAPI_GetDataAddress(dataAddressMap, rtwCAPI_GetSignalAddrIdx(signals, i));
+        const char *signalName = rtwCAPI_GetSignalName(signals, i);
+
+        if (typeId == A2L_TYPE_UNDEFINED || ptr == NULL || totalCount != 1u) {
+            continue;
+        }
+
+        nativeXcpBuildSymbol_(symbol, sizeof(symbol), "SIG", rtwCAPI_GetSignalBlockPath(signals, i),
+            signalName != NULL ? signalName : "signal", (uint32_t)ordinal);
+        nativeXcpDebugDumpScalar_("signal", symbol, ptr, typeId, totalCount);
+        printedSignals++;
+    }
+
+    for (i = 0u; i < (size_t)rtwCAPI_GetNumStates(mmi) && printedStates < NATIVE_XCP_DEBUG_DUMP_LIMIT; ++i, ++ordinal) {
+        char symbol[NATIVE_XCP_SYMBOL_CAPACITY];
+        const uint32_t totalCount = nativeXcpGetDimensions_(dimMap, dimensionArray,
+            rtwCAPI_GetStateDimensionIdx(states, i), NULL, NULL, NULL);
+        const tA2lTypeId typeId = nativeXcpGetType_(dataTypes, rtwCAPI_GetStateDataTypeIdx(states, i));
+        const void *ptr = rtwCAPI_GetDataAddress(dataAddressMap, rtwCAPI_GetStateAddrIdx(states, i));
+
+        if (typeId == A2L_TYPE_UNDEFINED || ptr == NULL || totalCount != 1u) {
+            continue;
+        }
+
+        nativeXcpBuildSymbol_(symbol, sizeof(symbol), "STATE", rtwCAPI_GetStateBlockPath(states, i),
+            rtwCAPI_GetStateName(states, i), (uint32_t)ordinal);
+        nativeXcpDebugDumpScalar_("state", symbol, ptr, typeId, totalCount);
+        printedStates++;
+    }
+
+    if ((size_t)rtwCAPI_GetNumSignals(mmi) > printedSignals) {
+        fprintf(stdout, "native_xcp: snapshot signal dump truncated at %u entries\n",
+            (unsigned)NATIVE_XCP_DEBUG_DUMP_LIMIT);
+    }
+    fflush(stdout);
+}
+#endif
+
+static void nativeXcpSetAffinityMask_(pthread_t thread, int coreA, int coreB, bool useTwoCores) {
+    cpu_set_t cpuSet;
+    int status;
+
+    CPU_ZERO(&cpuSet);
+    CPU_SET(coreA, &cpuSet);
+    if (useTwoCores && coreB >= 0 && coreB != coreA) {
+        CPU_SET(coreB, &cpuSet);
+    }
+
+    status = pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuSet);
+    if (status != 0) {
+        fprintf(stderr, "native_xcp: pthread_setaffinity_np failed (%d)\n", status);
+    }
+}
+
+static void nativeXcpAppendSanitized_(char *dst, size_t capacity, size_t *offset, const char *src) {
+    size_t i;
+
+    if (dst == NULL || offset == NULL || capacity == 0u || src == NULL) {
+        return;
+    }
+
+    for (i = 0u; src[i] != '\0' && *offset + 1u < capacity; ++i) {
+        const unsigned char ch = (unsigned char)src[i];
+        if ((ch >= 'A' && ch <= 'Z') ||
+            (ch >= 'a' && ch <= 'z') ||
+            (ch >= '0' && ch <= '9')) {
+            dst[*offset] = (char)ch;
+            (*offset)++;
+        } else if (*offset > 0u && dst[*offset - 1u] != '_') {
+            dst[*offset] = '_';
+            (*offset)++;
+        }
+    }
+
+    while (*offset > 0u && dst[*offset - 1u] == '_') {
+        (*offset)--;
+    }
+    dst[*offset] = '\0';
+}
+
+static void nativeXcpBuildSymbol_(char *dst,
+                                  size_t capacity,
+                                  const char *prefix,
+                                  const char *path,
+                                  const char *name,
+                                  uint32_t ordinal) {
+    size_t offset = 0u;
+
+    if (dst == NULL || capacity == 0u) {
+        return;
+    }
+
+    dst[0] = '\0';
+    nativeXcpAppendSanitized_(dst, capacity, &offset, prefix);
+    if (offset > 0u && offset + 1u < capacity) {
+        dst[offset++] = '_';
+        dst[offset] = '\0';
+    }
+
+    nativeXcpAppendSanitized_(dst, capacity, &offset, path);
+    if (name != NULL && name[0] != '\0' && offset + 1u < capacity) {
+        if (offset > 0u && dst[offset - 1u] != '_') {
+            dst[offset++] = '_';
+            dst[offset] = '\0';
+        }
+        nativeXcpAppendSanitized_(dst, capacity, &offset, name);
+    }
+
+    if (offset == 0u) {
+        (void)snprintf(dst, capacity, "%s_%u", prefix, ordinal);
+    } else {
+        (void)snprintf(dst + offset, capacity - offset, "_%u", ordinal);
+    }
+}
+
+static void nativeXcpBuildComment_(char *dst,
+                                   size_t capacity,
+                                   const char *path,
+                                   const char *name) {
+    if (dst == NULL || capacity == 0u) {
+        return;
+    }
+
+    if (path != NULL && name != NULL && path[0] != '\0' && name[0] != '\0') {
+        (void)snprintf(dst, capacity, "%s | %s", path, name);
+    } else if (path != NULL && path[0] != '\0') {
+        (void)snprintf(dst, capacity, "%s", path);
+    } else if (name != NULL && name[0] != '\0') {
+        (void)snprintf(dst, capacity, "%s", name);
+    } else {
+        dst[0] = '\0';
+    }
+}
+
+static tA2lTypeId nativeXcpGetType_(const rtwCAPI_DataTypeMap *typeMap, uint16_T typeIndex) {
+    const uint8_T slDataId = rtwCAPI_GetDataTypeSLId(typeMap, typeIndex);
+
+    switch (slDataId) {
+      case SS_DOUBLE:
+        return A2L_TYPE_DOUBLE;
+      case SS_SINGLE:
+        return A2L_TYPE_FLOAT;
+      case SS_INT8:
+        return A2L_TYPE_INT8;
+      case SS_UINT8:
+      case SS_BOOLEAN:
+        return A2L_TYPE_UINT8;
+      case SS_INT16:
+        return A2L_TYPE_INT16;
+      case SS_UINT16:
+        return A2L_TYPE_UINT16;
+      case SS_INT32:
+        return A2L_TYPE_INT32;
+      case SS_UINT32:
+        return A2L_TYPE_UINT32;
+      default:
+        break;
+    }
+
+    return A2L_TYPE_UNDEFINED;
+}
+
+static uint32_t nativeXcpGetDimensions_(const rtwCAPI_DimensionMap *dimMap,
+                                        const uint_T *dimensionArray,
+                                        uint16_T dimIndex,
+                                        uint32_t *xDim,
+                                        uint32_t *yDim,
+                                        uint32_t *numDimsOut) {
+    const uint_T dimArrayIndex = rtwCAPI_GetDimArrayIndex(dimMap, dimIndex);
+    const uint8_T numDims = rtwCAPI_GetNumDims(dimMap, dimIndex);
+    uint32_t total = 1u;
+    uint32_t x = 1u;
+    uint32_t y = 1u;
+    uint32_t i;
+
+    if (numDims > 0u) {
+        x = dimensionArray[dimArrayIndex] > 0u ? (uint32_t)dimensionArray[dimArrayIndex] : 1u;
+    }
+    if (numDims > 1u) {
+        y = dimensionArray[dimArrayIndex + 1u] > 0u ? (uint32_t)dimensionArray[dimArrayIndex + 1u] : 1u;
+    }
+    for (i = 0u; i < numDims; ++i) {
+        const uint32_t dimValue = dimensionArray[dimArrayIndex + i] > 0u ?
+            (uint32_t)dimensionArray[dimArrayIndex + i] : 1u;
+        total *= dimValue;
+    }
+
+    if (xDim != NULL) {
+        *xDim = x;
+    }
+    if (yDim != NULL) {
+        *yDim = y;
+    }
+    if (numDimsOut != NULL) {
+        *numDimsOut = (uint32_t)numDims;
+    }
+
+    return total;
+}
+
+static int nativeXcpCompareRange_(const void *lhs, const void *rhs) {
+    const NativeXcpRange *left = (const NativeXcpRange *)lhs;
+    const NativeXcpRange *right = (const NativeXcpRange *)rhs;
+
+    if (left->start < right->start) {
+        return -1;
+    }
+    if (left->start > right->start) {
+        return 1;
+    }
+    return 0;
+}
+
+static void nativeXcpCreateCalSegment_(uintptr_t start, uintptr_t end) {
+    NativeXcpCalSeg *seg;
+    const size_t size = (size_t)(end - start);
+
+    if (gNativeXcp.calSegCount >= NATIVE_XCP_MAX_CALSEGS || size == 0u || size > NATIVE_XCP_CAL_SEGMENT_LIMIT) {
+        return;
+    }
+
+    seg = &gNativeXcp.calSegs[gNativeXcp.calSegCount];
+    (void)snprintf(seg->name, sizeof(seg->name), "CalSeg_%03u", (unsigned)gNativeXcp.calSegCount);
+    seg->start = start;
+    seg->end = end;
+    seg->size = size;
+    seg->handle = XcpCreateCalSeg(seg->name, (const void *)start, (uint16_t)size);
+    if (seg->handle != XCP_UNDEFINED_CALSEG) {
+        seg->number = XcpGetCalSegNumber(seg->handle);
+        gNativeXcp.calSegCount++;
+    }
+}
+
+static void nativeXcpBuildCalibrationSegments_(const rtwCAPI_ModelMappingInfo *mmi) {
+    const rtwCAPI_BlockParameters *blockParameters = rtwCAPI_GetBlockParameters(mmi);
+    const rtwCAPI_ModelParameters *modelParameters = rtwCAPI_GetModelParameters(mmi);
+    const rtwCAPI_DataTypeMap *dataTypes = rtwCAPI_GetDataTypeMap(mmi);
+    const rtwCAPI_DimensionMap *dimMap = rtwCAPI_GetDimensionMap(mmi);
+    const uint_T *dimensionArray = rtwCAPI_GetDimensionArray(mmi);
+    void *const *dataAddressMap = (void *const *)rtwCAPI_GetDataAddressMap(mmi);
+    const size_t maxItems = (size_t)rtwCAPI_GetNumBlockParameters(mmi) + (size_t)rtwCAPI_GetNumModelParameters(mmi);
+    NativeXcpRange *ranges;
+    size_t used = 0u;
+    size_t i;
+    uintptr_t currentStart;
+    uintptr_t currentEnd;
+
+    if (maxItems == 0u) {
+        return;
+    }
+
+    ranges = (NativeXcpRange *)calloc(maxItems, sizeof(NativeXcpRange));
+    if (ranges == NULL) {
+        return;
+    }
+
+    for (i = 0u; i < (size_t)rtwCAPI_GetNumBlockParameters(mmi); ++i) {
+        const uint_T addrIdx = rtwCAPI_GetBlockParameterAddrIdx(blockParameters, i);
+        const uint32_t count = nativeXcpGetDimensions_(dimMap, dimensionArray,
+            rtwCAPI_GetBlockParameterDimensionIdx(blockParameters, i), NULL, NULL, NULL);
+        const size_t dataSize = (size_t)rtwCAPI_GetDataTypeSize(dataTypes,
+            rtwCAPI_GetBlockParameterDataTypeIdx(blockParameters, i));
+        const uintptr_t start = (uintptr_t)rtwCAPI_GetDataAddress(dataAddressMap, addrIdx);
+        const uintptr_t end = start + (uintptr_t)(count * dataSize);
+
+        if (start != 0u && end > start) {
+            ranges[used].start = start;
+            ranges[used].end = end;
+            used++;
+        }
+    }
+
+    for (i = 0u; i < (size_t)rtwCAPI_GetNumModelParameters(mmi); ++i) {
+        const uint_T addrIdx = rtwCAPI_GetModelParameterAddrIdx(modelParameters, i);
+        const uint32_t count = nativeXcpGetDimensions_(dimMap, dimensionArray,
+            rtwCAPI_GetModelParameterDimensionIdx(modelParameters, i), NULL, NULL, NULL);
+        const size_t dataSize = (size_t)rtwCAPI_GetDataTypeSize(dataTypes,
+            rtwCAPI_GetModelParameterDataTypeIdx(modelParameters, i));
+        const uintptr_t start = (uintptr_t)rtwCAPI_GetDataAddress(dataAddressMap, addrIdx);
+        const uintptr_t end = start + (uintptr_t)(count * dataSize);
+
+        if (start != 0u && end > start) {
+            ranges[used].start = start;
+            ranges[used].end = end;
+            used++;
+        }
+    }
+
+    if (used == 0u) {
+        free(ranges);
+        return;
+    }
+
+    qsort(ranges, used, sizeof(NativeXcpRange), nativeXcpCompareRange_);
+
+    currentStart = ranges[0].start;
+    currentEnd = ranges[0].end;
+    for (i = 1u; i < used; ++i) {
+        const uintptr_t gap = ranges[i].start > currentEnd ? ranges[i].start - currentEnd : 0u;
+        const uintptr_t mergedEnd = ranges[i].end > currentEnd ? ranges[i].end : currentEnd;
+        const uintptr_t mergedSize = mergedEnd - currentStart;
+
+        if (gap <= NATIVE_XCP_CAL_GAP_LIMIT && mergedSize <= NATIVE_XCP_CAL_SEGMENT_LIMIT) {
+            currentEnd = mergedEnd;
+        } else {
+            nativeXcpCreateCalSegment_(currentStart, currentEnd);
+            currentStart = ranges[i].start;
+            currentEnd = ranges[i].end;
+        }
+    }
+
+    nativeXcpCreateCalSegment_(currentStart, currentEnd);
+    free(ranges);
+}
+
+static const NativeXcpCalSeg *nativeXcpFindSegment_(const void *ptr) {
+    const uintptr_t address = (uintptr_t)ptr;
+    size_t i;
+
+    for (i = 0u; i < gNativeXcp.calSegCount; ++i) {
+        const NativeXcpCalSeg *seg = &gNativeXcp.calSegs[i];
+        if (address >= seg->start && address < seg->end) {
+            return seg;
+        }
+    }
+
+    return NULL;
+}
+
+static void nativeXcpRegisterParameter_(const char *symbol,
+                                        const char *comment,
+                                        const void *ptr,
+                                        tA2lTypeId typeId,
+                                        uint32_t xDim,
+                                        uint32_t yDim,
+                                        uint32_t totalCount) {
+    const NativeXcpCalSeg *seg = nativeXcpFindSegment_(ptr);
+
+    if (seg != NULL) {
+        A2lSetSegAddrMode(seg->handle, (const uint8_t *)seg->start);
+    } else {
+        A2lSetAbsAddrMode(gNativeXcp.events[0]);
+    }
+
+#if NATIVE_XCP_ENABLE_CALIBRATION_DEBUG
+    nativeXcpDebugPrintRegistration_("characteristic", symbol, ptr, typeId, totalCount, seg, -1);
+#endif
+
+    if (totalCount <= 1u) {
+        A2lCreateParameter_(symbol, typeId, ptr, comment, NULL, A2lGetTypeMin(typeId), A2lGetTypeMax(typeId));
+    } else if (yDim > 1u) {
+        A2lCreateMap_(symbol, typeId, ptr, xDim, yDim, comment, NULL, A2lGetTypeMin(typeId), A2lGetTypeMax(typeId),
+            NULL, NULL);
+    } else {
+        A2lCreateCurve_(symbol, typeId, ptr, totalCount, comment, NULL, A2lGetTypeMin(typeId), A2lGetTypeMax(typeId),
+            NULL);
+    }
+}
+
+static void nativeXcpRegisterMeasurement_(const char *symbol,
+                                          const char *comment,
+                                          const void *ptr,
+                                          tA2lTypeId typeId,
+                                          uint32_t xDim,
+                                          uint32_t yDim,
+                                          uint32_t totalCount,
+                                          uint8_T sampleTimeIndex) {
+    const tXcpEventId eventId = sampleTimeIndex < gNativeXcp.eventCount ? gNativeXcp.events[sampleTimeIndex] :
+        gNativeXcp.events[0];
+
+    A2lSetAbsAddrMode(eventId);
+#if NATIVE_XCP_ENABLE_CALIBRATION_DEBUG
+    nativeXcpDebugPrintRegistration_("measurement", symbol, ptr, typeId, totalCount, NULL, (int32_t)sampleTimeIndex);
+#endif
+    if (totalCount <= 1u) {
+        A2lCreateMeasurement_(NULL, symbol, typeId, 1u, ptr, NULL, A2lGetTypeMin(typeId), A2lGetTypeMax(typeId),
+            comment);
+    } else {
+        A2lCreateMeasurementArray_(NULL, symbol, typeId, (int)xDim, (int)yDim, ptr, NULL, A2lGetTypeMin(typeId),
+            A2lGetTypeMax(typeId), comment);
+    }
+}
+
+static void nativeXcpCreateEvents_(const rtwCAPI_ModelMappingInfo *mmi) {
+    const rtwCAPI_Signals *signals = rtwCAPI_GetSignals(mmi);
+    const rtwCAPI_States *states = rtwCAPI_GetStates(mmi);
+    const rtwCAPI_SampleTimeMap *sampleTimes = rtwCAPI_GetSampleTimeMap(mmi);
+    size_t maxIndex = 0u;
+    size_t i;
+
+    for (i = 0u; i < (size_t)rtwCAPI_GetNumSignals(mmi); ++i) {
+        const size_t index = (size_t)rtwCAPI_GetSignalSampleTimeIdx(signals, i);
+        if (index > maxIndex) {
+            maxIndex = index;
+        }
+    }
+    for (i = 0u; i < (size_t)rtwCAPI_GetNumStates(mmi); ++i) {
+        const size_t index = (size_t)rtwCAPI_GetStateSampleTimeIdx(states, i);
+        if (index > maxIndex) {
+            maxIndex = index;
+        }
+    }
+
+    gNativeXcp.eventCount = maxIndex + 1u;
+    if (gNativeXcp.eventCount == 0u) {
+        gNativeXcp.eventCount = 1u;
+    }
+    if (gNativeXcp.eventCount > NATIVE_XCP_MAX_EVENTS) {
+        gNativeXcp.eventCount = NATIVE_XCP_MAX_EVENTS;
+    }
+
+    for (i = 0u; i < gNativeXcp.eventCount; ++i) {
+        char eventName[48];
+        double period = rtwCAPI_GetSamplePeriod(sampleTimes, i);
+        uint32_t cycleNs = 0u;
+
+        if (period > 0.0) {
+            cycleNs = (uint32_t)llround(period * 1.0e9);
+        }
+        (void)snprintf(eventName, sizeof(eventName), "Task_%02u", (unsigned)i);
+        gNativeXcp.events[i] = XcpCreateEvent(eventName, cycleNs, 0u);
+        if (gNativeXcp.events[i] == XCP_UNDEFINED_EVENT_ID && i == 0u) {
+            gNativeXcp.events[i] = 0u;
+        }
+    }
+}
+
+static void nativeXcpRegisterModelObjects_(const rtwCAPI_ModelMappingInfo *mmi) {
+    const rtwCAPI_Signals *signals = rtwCAPI_GetSignals(mmi);
+    const rtwCAPI_States *states = rtwCAPI_GetStates(mmi);
+    const rtwCAPI_BlockParameters *blockParameters = rtwCAPI_GetBlockParameters(mmi);
+    const rtwCAPI_ModelParameters *modelParameters = rtwCAPI_GetModelParameters(mmi);
+    const rtwCAPI_DataTypeMap *dataTypes = rtwCAPI_GetDataTypeMap(mmi);
+    const rtwCAPI_DimensionMap *dimMap = rtwCAPI_GetDimensionMap(mmi);
+    const uint_T *dimensionArray = rtwCAPI_GetDimensionArray(mmi);
+    void *const *dataAddressMap = (void *const *)rtwCAPI_GetDataAddressMap(mmi);
+    size_t ordinal = 0u;
+    size_t i;
+
+    for (i = 0u; i < (size_t)rtwCAPI_GetNumBlockParameters(mmi); ++i, ++ordinal) {
+        char symbol[NATIVE_XCP_SYMBOL_CAPACITY];
+        char comment[NATIVE_XCP_COMMENT_CAPACITY];
+        uint32_t xDim;
+        uint32_t yDim;
+        uint32_t numDims;
+        const uint32_t totalCount = nativeXcpGetDimensions_(dimMap, dimensionArray,
+            rtwCAPI_GetBlockParameterDimensionIdx(blockParameters, i), &xDim, &yDim, &numDims);
+        const tA2lTypeId typeId = nativeXcpGetType_(dataTypes, rtwCAPI_GetBlockParameterDataTypeIdx(blockParameters, i));
+        const void *ptr = rtwCAPI_GetDataAddress(dataAddressMap, rtwCAPI_GetBlockParameterAddrIdx(blockParameters, i));
+
+        if (typeId == A2L_TYPE_UNDEFINED || ptr == NULL) {
+            continue;
+        }
+        if (numDims > 2u) {
+            xDim = totalCount;
+            yDim = 1u;
+        }
+
+        nativeXcpBuildSymbol_(symbol, sizeof(symbol), "PAR", rtwCAPI_GetBlockParameterBlockPath(blockParameters, i),
+            rtwCAPI_GetBlockParameterName(blockParameters, i), (uint32_t)ordinal);
+        nativeXcpBuildComment_(comment, sizeof(comment), rtwCAPI_GetBlockParameterBlockPath(blockParameters, i),
+            rtwCAPI_GetBlockParameterName(blockParameters, i));
+        nativeXcpRegisterParameter_(symbol, comment, ptr, typeId, xDim, yDim, totalCount);
+    }
+
+    for (i = 0u; i < (size_t)rtwCAPI_GetNumModelParameters(mmi); ++i, ++ordinal) {
+        char symbol[NATIVE_XCP_SYMBOL_CAPACITY];
+        char comment[NATIVE_XCP_COMMENT_CAPACITY];
+        uint32_t xDim;
+        uint32_t yDim;
+        uint32_t numDims;
+        const uint32_t totalCount = nativeXcpGetDimensions_(dimMap, dimensionArray,
+            rtwCAPI_GetModelParameterDimensionIdx(modelParameters, i), &xDim, &yDim, &numDims);
+        const tA2lTypeId typeId = nativeXcpGetType_(dataTypes, rtwCAPI_GetModelParameterDataTypeIdx(modelParameters, i));
+        const void *ptr = rtwCAPI_GetDataAddress(dataAddressMap, rtwCAPI_GetModelParameterAddrIdx(modelParameters, i));
+
+        if (typeId == A2L_TYPE_UNDEFINED || ptr == NULL) {
+            continue;
+        }
+        if (numDims > 2u) {
+            xDim = totalCount;
+            yDim = 1u;
+        }
+
+        nativeXcpBuildSymbol_(symbol, sizeof(symbol), "MODEL_PAR", NULL,
+            rtwCAPI_GetModelParameterName(modelParameters, i), (uint32_t)ordinal);
+        nativeXcpBuildComment_(comment, sizeof(comment), "ModelParameter", rtwCAPI_GetModelParameterName(modelParameters,
+            i));
+        nativeXcpRegisterParameter_(symbol, comment, ptr, typeId, xDim, yDim, totalCount);
+    }
+
+    for (i = 0u; i < (size_t)rtwCAPI_GetNumSignals(mmi); ++i, ++ordinal) {
+        char symbol[NATIVE_XCP_SYMBOL_CAPACITY];
+        char comment[NATIVE_XCP_COMMENT_CAPACITY];
+        uint32_t xDim;
+        uint32_t yDim;
+        uint32_t numDims;
+        const uint32_t totalCount = nativeXcpGetDimensions_(dimMap, dimensionArray,
+            rtwCAPI_GetSignalDimensionIdx(signals, i), &xDim, &yDim, &numDims);
+        const tA2lTypeId typeId = nativeXcpGetType_(dataTypes, rtwCAPI_GetSignalDataTypeIdx(signals, i));
+        const void *ptr = rtwCAPI_GetDataAddress(dataAddressMap, rtwCAPI_GetSignalAddrIdx(signals, i));
+        const char *signalName = rtwCAPI_GetSignalName(signals, i);
+
+        if (typeId == A2L_TYPE_UNDEFINED || ptr == NULL) {
+            continue;
+        }
+        if (numDims > 2u) {
+            xDim = totalCount;
+            yDim = 1u;
+        }
+
+        nativeXcpBuildSymbol_(symbol, sizeof(symbol), "SIG", rtwCAPI_GetSignalBlockPath(signals, i),
+            signalName != NULL ? signalName : "signal", (uint32_t)ordinal);
+        nativeXcpBuildComment_(comment, sizeof(comment), rtwCAPI_GetSignalBlockPath(signals, i),
+            signalName != NULL ? signalName : "signal");
+        nativeXcpRegisterMeasurement_(symbol, comment, ptr, typeId, xDim, yDim, totalCount,
+            rtwCAPI_GetSignalSampleTimeIdx(signals, i));
+    }
+
+    for (i = 0u; i < (size_t)rtwCAPI_GetNumStates(mmi); ++i, ++ordinal) {
+        char symbol[NATIVE_XCP_SYMBOL_CAPACITY];
+        char comment[NATIVE_XCP_COMMENT_CAPACITY];
+        uint32_t xDim;
+        uint32_t yDim;
+        uint32_t numDims;
+        const uint32_t totalCount = nativeXcpGetDimensions_(dimMap, dimensionArray,
+            rtwCAPI_GetStateDimensionIdx(states, i), &xDim, &yDim, &numDims);
+        const tA2lTypeId typeId = nativeXcpGetType_(dataTypes, rtwCAPI_GetStateDataTypeIdx(states, i));
+        const void *ptr = rtwCAPI_GetDataAddress(dataAddressMap, rtwCAPI_GetStateAddrIdx(states, i));
+
+        if (typeId == A2L_TYPE_UNDEFINED || ptr == NULL) {
+            continue;
+        }
+        if (numDims > 2u) {
+            xDim = totalCount;
+            yDim = 1u;
+        }
+
+        nativeXcpBuildSymbol_(symbol, sizeof(symbol), "STATE", rtwCAPI_GetStateBlockPath(states, i),
+            rtwCAPI_GetStateName(states, i), (uint32_t)ordinal);
+        nativeXcpBuildComment_(comment, sizeof(comment), rtwCAPI_GetStateBlockPath(states, i),
+            rtwCAPI_GetStateName(states, i));
+        nativeXcpRegisterMeasurement_(symbol, comment, ptr, typeId, xDim, yDim, totalCount,
+            rtwCAPI_GetStateSampleTimeIdx(states, i));
+    }
+}
+
+static void nativeXcpResolveBindAddress_(uint8_t out[4]) {
+    unsigned int octets[4] = {0u, 0u, 0u, 0u};
+    size_t i;
+
+    memset(out, 0, 4u);
+    if (sscanf(NATIVE_XCP_BIND_ADDRESS, "%u.%u.%u.%u",
+            &octets[0], &octets[1], &octets[2], &octets[3]) != 4) {
+        return;
+    }
+
+    for (i = 0u; i < 4u; ++i) {
+        if (octets[i] > 255u) {
+            memset(out, 0, 4u);
+            return;
+        }
+        out[i] = (uint8_t)octets[i];
+    }
+}
+
+void nativeXcpInitialize(void) {
+    const rtwCAPI_ModelMappingInfo *mmi = NATIVE_XCP_MODEL_MMI;
+    uint8_t bindAddr[4] = {0u, 0u, 0u, 0u};
+
+    if (gNativeXcp.initialized) {
+        return;
+    }
+
+    memset(&gNativeXcp, 0, sizeof(gNativeXcp));
+    nativeXcpResolveBindAddress_(bindAddr);
+    if (!XcpInit(NATIVE_XCP_MODEL_NAME, NATIVE_XCP_MODEL_EPK, XCP_MODE_LOCAL)) {
+        fprintf(stderr, "native_xcp: XcpInit failed\n");
+        return;
+    }
+    if (!XcpEthServerInit(bindAddr, NATIVE_XCP_PORT, true, NATIVE_XCP_QUEUE_BYTES)) {
+        fprintf(stderr, "native_xcp: XcpEthServerInit failed\n");
+        XcpDeinit();
+        return;
+    }
+
+    nativeXcpCreateEvents_(mmi);
+    nativeXcpBuildCalibrationSegments_(mmi);
+
+#if NATIVE_XCP_ENABLE_CALIBRATION_DEBUG
+    {
+        size_t i;
+        for (i = 0u; i < gNativeXcp.calSegCount; ++i) {
+            nativeXcpInitCalDebug_(&gNativeXcp.calSegs[i]);
+        }
+    }
+#endif
+
+    if (!A2lInit(bindAddr, NATIVE_XCP_PORT, true,
+            A2L_MODE_WRITE_ALWAYS | A2L_MODE_AUTO_GROUPS)) {
+        fprintf(stderr, "native_xcp: A2lInit failed\n");
+    } else {
+        nativeXcpRegisterModelObjects_(mmi);
+        gNativeXcp.a2lFinalized = A2lFinalize();
+    }
+
+#if NATIVE_XCP_ENABLE_CALIBRATION_DEBUG
+    nativeXcpDebugDumpRuntimeScalars_(mmi, "startup");
+    gNativeXcp.debugLastSnapshotClock = clockGet();
+#endif
+
+    gNativeXcp.initialized = true;
+}
+
+void nativeXcpPreStep(unsigned int taskId) {
+    size_t i;
+    (void)taskId;
+
+    for (i = 0u; i < gNativeXcp.calSegCount; ++i) {
+        NativeXcpCalSeg *seg = &gNativeXcp.calSegs[i];
+        const uint8_t *activePage = XcpLockCalSeg(seg->handle);
+#if NATIVE_XCP_ENABLE_CALIBRATION_DEBUG
+        if (XcpIsConnected()) {
+            if (nativeXcpLogCalPageState_(seg) || nativeXcpLogCalMutation_(seg, activePage)) {
+                gNativeXcp.debugSnapshotPending = true;
+            }
+        }
+#endif
+        if (activePage != NULL && (const void *)activePage != (const void *)seg->start) {
+            memcpy((void *)seg->start, activePage, seg->size);
+        }
+        XcpUnlockCalSeg(seg->handle);
+    }
+}
+
+void nativeXcpPostStep(unsigned int taskId) {
+    if (taskId >= gNativeXcp.eventCount) {
+        taskId = 0u;
+    }
+    if (taskId < gNativeXcp.eventCount && gNativeXcp.events[taskId] != XCP_UNDEFINED_EVENT_ID) {
+        XcpEvent(gNativeXcp.events[taskId]);
+    }
+#if NATIVE_XCP_ENABLE_CALIBRATION_DEBUG
+    {
+        const uint64_t now = clockGet();
+        const bool periodicDue = (gNativeXcp.debugLastSnapshotClock == 0u) ||
+            (now - gNativeXcp.debugLastSnapshotClock >= CLOCK_TICKS_PER_S);
+
+        if (periodicDue) {
+            nativeXcpDebugDumpRuntimeScalars_(NATIVE_XCP_MODEL_MMI,
+                gNativeXcp.debugSnapshotPending ? "post-calibration-step" : "periodic");
+            gNativeXcp.debugLastSnapshotClock = now;
+            gNativeXcp.debugSnapshotPending = false;
+        }
+    }
+#endif
+}
+
+void nativeXcpShutdown(void) {
+    if (!gNativeXcp.initialized) {
+        return;
+    }
+
+#if NATIVE_XCP_ENABLE_CALIBRATION_DEBUG
+    {
+        size_t i;
+        for (i = 0u; i < gNativeXcp.calSegCount; ++i) {
+            nativeXcpFreeCalDebug_(&gNativeXcp.calSegs[i]);
+        }
+    }
+#endif
+
+    XcpDisconnect();
+    XcpEthServerShutdown();
+    XcpDeinit();
+    memset(&gNativeXcp, 0, sizeof(gNativeXcp));
+}
+
+void nativeXcpApplyThreadAffinity(void) {
+    nativeXcpSetAffinityMask_(pthread_self(), NATIVE_XCP_MODEL_CORE_A, NATIVE_XCP_MODEL_CORE_B, true);
+    nativeXcpSetAffinityMask_(baseRateThread, NATIVE_XCP_MODEL_CORE_A, -1, false);
+    nativeXcpSetAffinityMask_(schedulerThread, NATIVE_XCP_MODEL_CORE_B, -1, false);
+
+#if (MW_NUMBER_SUBRATES > 0)
+    {
+        int i;
+        for (i = 0; i < MW_NUMBER_SUBRATES; ++i) {
+            const int core = (i % 2) == 0 ? NATIVE_XCP_MODEL_CORE_B : NATIVE_XCP_MODEL_CORE_A;
+            nativeXcpSetAffinityMask_(subRateThread[i], core, -1, false);
+        }
+    }
+#endif
+}

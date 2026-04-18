@@ -1,0 +1,7 @@
+#pragma once
+
+void nativeXcpInitialize(void);
+void nativeXcpPreStep(unsigned int taskId);
+void nativeXcpPostStep(unsigned int taskId);
+void nativeXcpShutdown(void);
+void nativeXcpApplyThreadAffinity(void);

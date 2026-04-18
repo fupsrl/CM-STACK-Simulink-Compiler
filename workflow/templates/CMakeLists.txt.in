@@ -1,0 +1,92 @@
+cmake_minimum_required(VERSION 3.16)
+
+project(@MODEL_NAME@_native_xcp C)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
+
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
+endif()
+
+execute_process(
+    COMMAND nproc
+    OUTPUT_VARIABLE NATIVE_XCP_NPROC
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+if(NOT NATIVE_XCP_NPROC)
+    set(NATIVE_XCP_NPROC 4)
+endif()
+
+set(NATIVE_XCP_TARGET "@MODEL_NAME@")
+file(GLOB NATIVE_XCP_GENERATED_SOURCES CONFIGURE_DEPENDS generated/*.c)
+
+set(NATIVE_XCP_SOURCES
+    ${NATIVE_XCP_GENERATED_SOURCES}
+    src/native_xcp_runtime.c
+    src/MW_Pyserver_control.c
+    src/MW_raspi_init.c
+    rtos/linuxinitialize.c
+    third_party/xcplite/src/a2l.c
+    third_party/xcplite/src/a2l_writer.c
+    third_party/xcplite/src/cal.c
+    third_party/xcplite/src/persistence.c
+    third_party/xcplite/src/platform.c
+    third_party/xcplite/src/queue32.c
+    third_party/xcplite/src/queue64f.c
+    third_party/xcplite/src/queue64v.c
+    third_party/xcplite/src/shm.c
+    third_party/xcplite/src/xcpappl.c
+    third_party/xcplite/src/xcpethserver.c
+    third_party/xcplite/src/xcpethtl.c
+    third_party/xcplite/src/xcplite.c
+)
+
+add_executable(${NATIVE_XCP_TARGET} ${NATIVE_XCP_SOURCES})
+
+target_include_directories(${NATIVE_XCP_TARGET} PRIVATE
+    generated
+    src
+    rtos
+    matlab_inc
+    third_party/xcplite/inc
+    third_party/xcplite/src
+)
+
+target_compile_options(${NATIVE_XCP_TARGET} PRIVATE
+    -O2
+    -g
+    -gdwarf-3
+    -fno-omit-frame-pointer
+    -fno-optimize-sibling-calls
+    -Wall
+    -Wextra
+    -Wno-unused-parameter
+)
+
+target_compile_definitions(${NATIVE_XCP_TARGET} PRIVATE
+    _GNU_SOURCE
+    MW_NUM_CORES=${NATIVE_XCP_NPROC}
+    OPTION_CAL_SEGMENTS_ABS
+    OPTION_ENABLE_GET_LOCAL_ADDR
+    OPTION_XCP_SERVER_RX_CORE=@XCP_SERVER_CORE@
+    OPTION_XCP_SERVER_TX_CORE=@XCP_SERVER_CORE@
+@EXTRA_COMPILE_DEFINITIONS@
+)
+
+find_library(ATOMIC_LIB atomic)
+if(ATOMIC_LIB)
+    target_link_libraries(${NATIVE_XCP_TARGET} PRIVATE ${ATOMIC_LIB})
+endif()
+
+target_link_libraries(${NATIVE_XCP_TARGET} PRIVATE m rt pthread dl)
+
+add_custom_command(
+    TARGET ${NATIVE_XCP_TARGET}
+    POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/xcplite/XCP_104.aml
+            $<TARGET_FILE_DIR:${NATIVE_XCP_TARGET}>/XCP_104.aml
+)

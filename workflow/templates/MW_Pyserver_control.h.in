@@ -1,0 +1,19 @@
+#ifndef _MW_PYSERVER_CONTROL_H_
+#define _MW_PYSERVER_CONTROL_H_
+
+#include "rtwtypes.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void MW_getDefines(void);
+void MW_killPyserver(void);
+void MW_launchPyserver(void);
+void MW_execmd(char *buff);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

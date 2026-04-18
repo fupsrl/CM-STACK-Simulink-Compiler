@@ -1,0 +1,14 @@
+#include "MW_Pyserver_control.h"
+
+void MW_getDefines(void) {
+}
+
+void MW_killPyserver(void) {
+}
+
+void MW_launchPyserver(void) {
+}
+
+void MW_execmd(char *buff) {
+    (void)buff;
+}
