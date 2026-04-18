@@ -150,6 +150,6 @@ After this settings, simply run runAndBuildModel.m
 
 ## License
 
-See [LICENSE.txt](LICENSE.txt).
-Code cleaned and refactored with LLMs
-Critical workflow obscured because I do not want that Mathworks steals years of work just for free
+See [LICENSE.txt](LICENSE.txt).<br />
+Code cleaned and refactored with LLMs<br />
+Critical workflow obscured because I do not want that Mathworks steals years of work just for free<br />
